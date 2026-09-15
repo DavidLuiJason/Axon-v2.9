@@ -21,6 +21,11 @@ import {
   CheckCircle2,
   FolderDown,
   Trash2,
+  Play,
+  Pause,
+  XCircle,
+  Activity,
+  Gauge,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { ScreenId } from '../../types';
@@ -49,6 +54,8 @@ import {
   buildResultFileFromStitched,
   buildFailureResultFile,
 } from '../../lib/interfaceCaptureEngine';
+import { captureJobManager } from '../../lib/interfaceCaptureJobManager';
+import { CaptureJob } from '../../lib/captureTypes';
 
 export const InterfaceCaptureScreen: React.FC = () => {
   const { currentScreen, showToast, requestConfirmation, previousScreen } = useApp();
@@ -63,6 +70,8 @@ export const InterfaceCaptureScreen: React.FC = () => {
 
   // Execution & Progress State
   const [isCapturing, setIsCapturing] = useState<boolean>(false);
+  const [activeJob, setActiveJob] = useState<CaptureJob | null>(() => captureJobManager.getActiveJob());
+  const [showDiagnostics, setShowDiagnostics] = useState<boolean>(false);
   const [progress, setProgress] = useState<{ current: number; total: number; interfaceName: string; percent: number } | null>(null);
   const [capturedResults, setCapturedResults] = useState<CapturedInterfaceResult[]>([]);
   const [generatedFiles, setGeneratedFiles] = useState<GeneratedResultFile[]>([]);
@@ -79,6 +88,30 @@ export const InterfaceCaptureScreen: React.FC = () => {
   useEffect(() => {
     setAvailableInterfaces(discoverAvailableInterfaces());
   }, []);
+
+  // Subscribe to background job manager so state survives navigation across screens
+  useEffect(() => {
+    const unsubscribe = captureJobManager.subscribe((job) => {
+      setActiveJob({ ...job });
+      setIsCapturing(job.status === 'running');
+
+      const exportable = captureJobManager.getExportableCaptureResults();
+      if (exportable.length > 0) {
+        setCapturedResults(exportable);
+        const files: GeneratedResultFile[] = [];
+        for (const exp of exportable) {
+          files.push(buildResultFileFromCapture(exp, exportFormat === 'jpeg' ? 'jpg' : 'png'));
+          if (exp.panelResults && exp.panelResults.length > 0) {
+            for (const panel of exp.panelResults) {
+              files.push(buildResultFileFromCapture(panel, exportFormat === 'jpeg' ? 'jpg' : 'png'));
+            }
+          }
+        }
+        setGeneratedFiles(files);
+      }
+    });
+    return () => unsubscribe();
+  }, [exportFormat]);
 
   // Determine current screen name
   const currentMeta = getInterfaceById(previousScreen && previousScreen !== 'tool_interface_capture' ? previousScreen : currentScreen) || availableInterfaces[0];
@@ -100,194 +133,56 @@ export const InterfaceCaptureScreen: React.FC = () => {
   const handleExecuteCapture = async () => {
     if (isCapturing) return;
     setIsCapturing(true);
-    setProgress(null);
 
     const isFull = captureType === 'full';
     const imgFormat = exportFormat === 'jpeg' ? 'jpeg' : 'png';
 
     try {
+      let targetIds: string[] | undefined = undefined;
       if (captureScope === 'current') {
-        // Target previous screen if came from another tool, or current screen
         const targetRoute = previousScreen && previousScreen !== 'tool_interface_capture' ? previousScreen : currentScreen;
-        const results = await captureLiveInterfaceWithPanels(targetRoute, {
-          fullHeight: isFull,
-          format: imgFormat,
-        });
-
-        const files: GeneratedResultFile[] = results.map((r) =>
-          buildResultFileFromCapture(r, imgFormat === 'jpeg' ? 'jpg' : 'png')
-        );
-
-        if (exportFormat === 'pdf') {
-          const pdfDoc = await exportCapturesToPdf(results, getSafeInterfaceFileName(results[0].name, 'pdf'));
-          files.unshift(buildResultFileFromPdf(pdfDoc, results[0].name, results[0].category, results[0].route, results.length));
-          triggerCaptureDownload(pdfDoc.dataUrl, pdfDoc.filename);
-          showToast(`Exported ${results.length > 1 ? `${results.length}-page ` : ''}PDF document`);
-        } else if (exportFormat === 'long_image' && results.length > 1) {
-          const longImg = await stitchCanvasesVertically(results, { format: imgFormat });
-          files.unshift(buildResultFileFromStitched(longImg, `Combined Interfaces (${results.length})`, 'Combined Long Image'));
-          triggerCaptureDownload(longImg.dataUrl, longImg.filename);
-          showToast(`Stitched & exported ${results.length} captures as Long Image`);
-        } else {
-          showToast(
-            results.length > 1
-              ? `Captured "${results[0].name}" + ${results.length - 1} panels`
-              : `Captured "${results[0].name}" (${results[0].formattedSize})`
-          );
-        }
-
-        setCapturedResults(results);
-        setGeneratedFiles(files);
-        setMultiReport(null);
-        setTimeout(() => resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
+        targetIds = [targetRoute];
       } else if (captureScope === 'specific') {
-        const results = await captureInterfaceByIdWithPanels(selectedInterfaceId, {
-          fullHeight: isFull,
-          format: imgFormat,
-        });
-
-        const files: GeneratedResultFile[] = results.map((r) =>
-          buildResultFileFromCapture(r, imgFormat === 'jpeg' ? 'jpg' : 'png')
-        );
-
-        if (exportFormat === 'pdf') {
-          const pdfDoc = await exportCapturesToPdf(results, getSafeInterfaceFileName(results[0].name, 'pdf'));
-          files.unshift(buildResultFileFromPdf(pdfDoc, results[0].name, results[0].category, results[0].route, results.length));
-          triggerCaptureDownload(pdfDoc.dataUrl, pdfDoc.filename);
-          showToast(`Exported ${results.length > 1 ? `${results.length}-page ` : ''}PDF document`);
-        } else if (exportFormat === 'long_image' && results.length > 1) {
-          const longImg = await stitchCanvasesVertically(results, { format: imgFormat });
-          files.unshift(buildResultFileFromStitched(longImg, `Combined Interfaces (${results.length})`, 'Combined Long Image'));
-          triggerCaptureDownload(longImg.dataUrl, longImg.filename);
-          showToast(`Stitched & exported ${results.length} captures as Long Image`);
-        } else {
-          showToast(
-            results.length > 1
-              ? `Captured "${results[0].name}" + ${results.length - 1} panels`
-              : `Captured "${results[0].name}" (${results[0].formattedSize})`
-          );
-        }
-
-        setCapturedResults(results);
-        setGeneratedFiles(files);
-        setMultiReport(null);
-        setTimeout(() => resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
+        targetIds = [selectedInterfaceId];
       } else if (captureScope === 'multiple') {
         if (selectedMultipleIds.length === 0) {
           showToast('Please select at least one interface to capture.');
           setIsCapturing(false);
           return;
         }
-
-        setCapturedResults([]);
-        setGeneratedFiles([]);
-
-        const report = await captureMultipleInterfaces(selectedMultipleIds, {
-          fullHeight: isFull,
-          format: imgFormat,
-          forceRefresh: forceRecapture,
-          onProgress: (prog) => setProgress(prog),
-          onResult: (res) => {
-            const newFile = buildResultFileFromCapture(res, imgFormat === 'jpeg' ? 'jpg' : 'png');
-            setCapturedResults((prev) => [...prev, res]);
-            setGeneratedFiles((prev) => [...prev, newFile]);
-          },
-        });
-
-        // Add failure placeholder files if any
-        if (report.failures.length > 0) {
-          const failFiles = report.failures.map((f) => buildFailureResultFile(f.name, f.route, f.error));
-          setGeneratedFiles((prev) => [...prev, ...failFiles]);
-        }
-
-        if (exportFormat === 'long_image' && report.results.length > 0) {
-          const longImg = await stitchCanvasesVertically(report.results, { format: imgFormat });
-          const stitchedFile = buildResultFileFromStitched(longImg, `Combined Interfaces (${report.results.length})`, 'Combined Long Image');
-          setGeneratedFiles((prev) => [stitchedFile, ...prev]);
-          triggerCaptureDownload(longImg.dataUrl, longImg.filename);
-          showToast(`Stitched & exported ${report.results.length} interfaces as Long Image`);
-        } else if (exportFormat === 'pdf' && report.results.length > 0) {
-          const pdfDoc = await exportCapturesToPdf(report.results, 'AXON_Interface_Documentation.pdf');
-          const pdfFile = buildResultFileFromPdf(pdfDoc, `Interface Documentation (${report.results.length} Pages)`, 'Documentation PDF', 'all', report.results.length);
-          setGeneratedFiles((prev) => [pdfFile, ...prev]);
-          triggerCaptureDownload(pdfDoc.dataUrl, pdfDoc.filename);
-          showToast(`Exported ${report.results.length} interfaces as PDF document`);
-        } else {
-          showToast(`Captured ${report.successfulCount} interfaces (${(report.totalDurationMs / 1000).toFixed(1)}s)`);
-        }
-
-        setCapturedResults(report.results);
-        setMultiReport(report);
-        setTimeout(() => resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
+        targetIds = selectedMultipleIds;
       } else if (captureScope === 'all') {
-        setCapturedResults([]);
-        setGeneratedFiles([]);
-
-        const report = await captureAllInterfaces({
-          fullHeight: isFull,
-          format: imgFormat,
-          forceRefresh: forceRecapture,
-          onProgress: (prog) => setProgress(prog),
-          onResult: (res) => {
-            const newFile = buildResultFileFromCapture(res, imgFormat === 'jpeg' ? 'jpg' : 'png');
-            setCapturedResults((prev) => [...prev, res]);
-            setGeneratedFiles((prev) => [...prev, newFile]);
-          },
-        });
-
-        if (report.failures.length > 0) {
-          const failFiles = report.failures.map((f) => buildFailureResultFile(f.name, f.route, f.error));
-          setGeneratedFiles((prev) => [...prev, ...failFiles]);
-        }
-
-        if (exportFormat === 'long_image' && report.results.length > 0) {
-          const longImg = await stitchCanvasesVertically(report.results, { format: imgFormat });
-          const stitchedFile = buildResultFileFromStitched(longImg, `All AXON Interfaces (${report.results.length})`, 'Combined Long Image');
-          setGeneratedFiles((prev) => [stitchedFile, ...prev]);
-          triggerCaptureDownload(longImg.dataUrl, longImg.filename);
-          showToast(`Stitched all ${report.results.length} interfaces as Long Image`);
-        } else if (exportFormat === 'pdf' && report.results.length > 0) {
-          const pdfDoc = await exportCapturesToPdf(report.results, 'AXON_Interface_Documentation.pdf');
-          const pdfFile = buildResultFileFromPdf(pdfDoc, `AXON Interface Documentation (${report.results.length} Pages)`, 'Documentation PDF', 'all', report.results.length);
-          setGeneratedFiles((prev) => [pdfFile, ...prev]);
-          triggerCaptureDownload(pdfDoc.dataUrl, pdfDoc.filename);
-          showToast(`Exported all ${report.results.length} interfaces to PDF`);
-        } else {
-          showToast(`All-interface capture complete (${report.successfulCount} captured in ${(report.totalDurationMs / 1000).toFixed(1)}s)`);
-        }
-
-        setCapturedResults(report.results);
-        setMultiReport(report);
-        setTimeout(() => resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
+        targetIds = undefined;
       }
+
+      showToast(
+        targetIds
+          ? `Starting background capture for ${targetIds.length} interface${targetIds.length > 1 ? 's' : ''}...`
+          : 'Starting full system interface capture in background...'
+      );
+
+      await captureJobManager.startJob(targetIds, {
+        forceRecapture,
+        fullHeight: isFull,
+        format: imgFormat,
+      });
+
+      setTimeout(() => resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 200);
     } catch (err: any) {
       console.error('Capture execution failure:', err);
       showToast(err?.message || 'Capture failed');
-    } finally {
       setIsCapturing(false);
-      setProgress(null);
     }
   };
 
   const handleRetrySingle = async (interfaceIdOrRoute: string, name: string) => {
     try {
       showToast(`Retrying capture for "${name}"...`);
-      const results = await captureInterfaceByIdWithPanels(interfaceIdOrRoute, {
+      await captureJobManager.retrySingleItem(interfaceIdOrRoute, {
         fullHeight: captureType === 'full',
         format: exportFormat === 'jpeg' ? 'jpeg' : 'png',
-      }, new Set<string>(), 0);
-
-      // Remove failure placeholder from generatedFiles and add successful file(s)
-      setGeneratedFiles((prev) => {
-        const filtered = prev.filter((f) => f.route !== interfaceIdOrRoute || f.status !== 'failed');
-        const newFiles = results.map((r) =>
-          buildResultFileFromCapture(r, exportFormat === 'jpeg' ? 'jpg' : 'png')
-        );
-        return [...filtered, ...newFiles];
       });
-
-      setCapturedResults((prev) => [...prev, ...results]);
-      showToast(`Successfully captured "${name}"`);
+      showToast(`Retry scheduled for "${name}"`);
     } catch (err: any) {
       showToast(`Retry failed for "${name}": ${err?.message || 'Error'}`);
     }
@@ -612,27 +507,196 @@ export const InterfaceCaptureScreen: React.FC = () => {
           </button>
         </div>
 
-        {/* 4. Active Progress Bar (Requirement 15) */}
-        {progress && (
-          <div className="p-3.5 rounded-2xl bg-neutral-900 border border-neutral-800 space-y-2 animate-in fade-in duration-200">
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-neutral-400">Capturing AXON interfaces...</span>
-              <span className="font-mono text-white font-bold">
-                {progress.current} / {progress.total}
-              </span>
+        {/* 4. Persistent Background Job Monitor (Requirements 14, 15, 16) */}
+        {activeJob && (activeJob.status === 'running' || activeJob.status === 'paused' || activeJob.status === 'interrupted' || activeJob.status === 'completed') && (
+          <div className="p-3.5 rounded-2xl bg-neutral-900/95 border border-neutral-800 space-y-2.5 animate-in fade-in duration-200">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div
+                  className={`w-2.5 h-2.5 rounded-full ${
+                    activeJob.status === 'running'
+                      ? 'bg-emerald-400 animate-pulse'
+                      : activeJob.status === 'paused'
+                      ? 'bg-amber-400'
+                      : activeJob.status === 'completed'
+                      ? 'bg-blue-400'
+                      : 'bg-rose-400'
+                  }`}
+                />
+                <span className="text-xs font-bold text-white uppercase tracking-wider">
+                  Capture Pipeline
+                </span>
+                <span
+                  className={`text-[9px] px-1.5 py-0.5 rounded font-mono uppercase font-semibold ${
+                    activeJob.status === 'running'
+                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                      : activeJob.status === 'paused'
+                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                      : activeJob.status === 'completed'
+                      ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+                      : 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                  }`}
+                >
+                  {activeJob.status}
+                </span>
+              </div>
+
+              {/* Action Controls */}
+              <div className="flex items-center gap-1.5">
+                {activeJob.status === 'running' && (
+                  <button
+                    type="button"
+                    onClick={() => captureJobManager.pauseJob()}
+                    className="px-2 py-1 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-[10px] text-amber-300 flex items-center gap-1 font-medium transition-all"
+                  >
+                    <Pause className="w-3 h-3" />
+                    <span>Pause</span>
+                  </button>
+                )}
+                {(activeJob.status === 'paused' || activeJob.status === 'interrupted') && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      captureJobManager.resumeJob({
+                        forceRecapture,
+                        fullHeight: captureType === 'full',
+                        format: exportFormat === 'jpeg' ? 'jpeg' : 'png',
+                      })
+                    }
+                    className="px-2 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-[10px] text-white flex items-center gap-1 font-medium transition-all"
+                  >
+                    <Play className="w-3 h-3" />
+                    <span>Resume</span>
+                  </button>
+                )}
+                {activeJob.status !== 'completed' && (
+                  <button
+                    type="button"
+                    onClick={() => captureJobManager.cancelJob()}
+                    className="px-2 py-1 rounded-lg bg-neutral-800 hover:bg-rose-900/40 text-[10px] text-neutral-400 hover:text-rose-300 flex items-center gap-1 transition-all"
+                  >
+                    <XCircle className="w-3 h-3" />
+                    <span>Cancel</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setShowDiagnostics(!showDiagnostics)}
+                  className={`px-2 py-1 rounded-lg text-[10px] flex items-center gap-1 transition-all ${
+                    showDiagnostics
+                      ? 'bg-neutral-700 text-white font-medium'
+                      : 'bg-neutral-800 text-neutral-400 hover:text-white'
+                  }`}
+                  title="Toggle Diagnostics"
+                >
+                  <Activity className="w-3 h-3" />
+                  <span>Metrics</span>
+                </button>
+              </div>
             </div>
-            <div className="w-full h-2 bg-neutral-800 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-white transition-all duration-150 rounded-full"
-                style={{ width: `${progress.percent}%` }}
-              />
+
+            {/* Stage Progress Bar */}
+            <div className="space-y-1">
+              <div className="w-full h-2 bg-neutral-800 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-white transition-all duration-200 rounded-full"
+                  style={{ width: `${activeJob.progress.percent}%` }}
+                />
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-neutral-400">
+                <span className="truncate">
+                  Current: <strong className="text-white">{activeJob.progress.currentInterfaceName || 'Idle'}</strong>
+                  {activeJob.progress.currentStage && activeJob.status === 'running' && (
+                    <span className="ml-1.5 text-[10px] text-sky-400 font-mono">
+                      [{activeJob.progress.currentStage}]
+                    </span>
+                  )}
+                </span>
+                <span className="font-mono text-white font-bold">{activeJob.progress.percent}%</span>
+              </div>
             </div>
-            <div className="flex items-center justify-between text-[11px]">
-              <span className="text-neutral-300 truncate">
-                Current: <strong className="text-white">{progress.interfaceName}</strong>
-              </span>
-              <span className="text-neutral-500 font-mono">{progress.percent}%</span>
+
+            {/* Requirement 14 Persistent Status Matrix */}
+            <div className="grid grid-cols-3 sm:grid-cols-6 gap-1 pt-1 text-center font-mono">
+              <div className="p-1 rounded-xl bg-neutral-950/80 border border-neutral-800">
+                <div className="text-[8px] text-neutral-500 uppercase">Discovered</div>
+                <div className="text-xs font-bold text-white">{activeJob.progress.totalDiscovered}</div>
+              </div>
+              <div className="p-1 rounded-xl bg-neutral-950/80 border border-neutral-800">
+                <div className="text-[8px] text-neutral-500 uppercase">Completed</div>
+                <div className="text-xs font-bold text-emerald-400">{activeJob.progress.completed}</div>
+              </div>
+              <div className="p-1 rounded-xl bg-neutral-950/80 border border-neutral-800">
+                <div className="text-[8px] text-neutral-500 uppercase">Processing</div>
+                <div className="text-xs font-bold text-sky-400">
+                  {activeJob.progress.capturing +
+                    activeJob.progress.segmenting +
+                    activeJob.progress.analyzing +
+                    activeJob.progress.verifying}
+                </div>
+              </div>
+              <div className="p-1 rounded-xl bg-neutral-950/80 border border-neutral-800">
+                <div className="text-[8px] text-neutral-500 uppercase">Queued</div>
+                <div className="text-xs font-bold text-neutral-300">{activeJob.progress.queued}</div>
+              </div>
+              <div className="p-1 rounded-xl bg-neutral-950/80 border border-neutral-800">
+                <div className="text-[8px] text-neutral-500 uppercase">Retrying</div>
+                <div className="text-xs font-bold text-amber-400">{activeJob.progress.retrying}</div>
+              </div>
+              <div className="p-1 rounded-xl bg-neutral-950/80 border border-neutral-800">
+                <div className="text-[8px] text-neutral-500 uppercase">Failed</div>
+                <div className="text-xs font-bold text-rose-400">{activeJob.progress.failed}</div>
+              </div>
             </div>
+
+            {/* Requirement 19: Performance Diagnostics Expanded View */}
+            {showDiagnostics && (
+              <div className="p-2.5 rounded-xl bg-neutral-950 border border-neutral-800 space-y-1.5 font-mono text-[10px] animate-in fade-in duration-150">
+                <div className="flex items-center justify-between text-neutral-400 border-b border-neutral-800/80 pb-1">
+                  <span className="font-bold text-white flex items-center gap-1">
+                    <Gauge className="w-3 h-3 text-sky-400" />
+                    Stage Latency Breakdown
+                  </span>
+                  <span className="text-[9px] text-neutral-500">
+                    Avg {activeJob.diagnostics.avgTimePerItemMs}ms/item • Peak {activeJob.diagnostics.peakConcurrency} slots
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-neutral-300 pt-0.5">
+                  <div className="flex flex-col">
+                    <span className="text-[8px] text-neutral-500 uppercase">Discovery</span>
+                    <span className="font-bold">{activeJob.diagnostics.stageAverages.discoveryMs} ms</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-[8px] text-neutral-500 uppercase">Rendering</span>
+                    <span className="font-bold text-sky-400">{activeJob.diagnostics.stageAverages.renderingMs} ms</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-[8px] text-neutral-500 uppercase">Screenshot</span>
+                    <span className="font-bold text-indigo-400">{activeJob.diagnostics.stageAverages.screenshotMs} ms</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-[8px] text-neutral-500 uppercase">Segmentation</span>
+                    <span className="font-bold text-purple-400">{activeJob.diagnostics.stageAverages.segmentationMs} ms</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-[8px] text-neutral-500 uppercase">Analysis (2-Pass)</span>
+                    <span className="font-bold text-amber-400">{activeJob.diagnostics.stageAverages.analysisMs} ms</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-[8px] text-neutral-500 uppercase">Verification</span>
+                    <span className="font-bold text-emerald-400">{activeJob.diagnostics.stageAverages.verificationMs} ms</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-[8px] text-neutral-500 uppercase">Storage</span>
+                    <span className="font-bold text-neutral-400">{activeJob.diagnostics.stageAverages.storageMs} ms</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-[8px] text-neutral-500 uppercase">Cache Hits</span>
+                    <span className="font-bold text-emerald-300">{activeJob.diagnostics.cacheHitCount} items</span>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
