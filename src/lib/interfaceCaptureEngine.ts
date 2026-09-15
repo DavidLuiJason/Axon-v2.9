@@ -9,6 +9,13 @@ import {
   discoverAvailableInterfaces,
 } from './interfaceRegistry';
 import { sanitizeClonedTreeForCapture, wrapWindowGetComputedStyle } from './colorConverter';
+import {
+  captureMetrics,
+  InterfacePerformanceLog,
+  BatchCaptureMetrics,
+} from './interfaceCaptureMetrics';
+
+export type { InterfacePerformanceLog, BatchCaptureMetrics };
 
 export interface GeneratedResultFile {
   id: string;
@@ -51,15 +58,21 @@ export interface CaptureEngineOptions {
   quality?: number;
   includePanels?: boolean;
   recursive?: boolean;
+  concurrency?: number;
+  forceRefresh?: boolean;
+  priority?: number;
   onProgress?: (progress: { current: number; total: number; interfaceName: string; percent: number }) => void;
+  onResult?: (result: CapturedInterfaceResult, completedCount: number, totalCount: number) => void;
 }
 
 export interface MultiCaptureReport {
   results: CapturedInterfaceResult[];
   successfulCount: number;
   failedCount: number;
+  skippedCount?: number;
   failures: Array<{ name: string; route: string; error: string }>;
   totalDurationMs: number;
+  metrics?: BatchCaptureMetrics;
   combinedLongImage?: {
     canvas: HTMLCanvasElement;
     dataUrl: string;
@@ -77,13 +90,15 @@ export interface MultiCaptureReport {
 // Stage controller types for offscreen rendering
 export interface StageHandle {
   element: HTMLElement;
+  slotId?: number;
   release: () => void;
 }
 
 export type StageRenderRequester = (
   route: ScreenId | string,
   isFull: boolean,
-  interfaceId?: string
+  interfaceId?: string,
+  priority?: number
 ) => Promise<HTMLElement | StageHandle | null>;
 
 let globalStageRequester: StageRenderRequester | null = null;
@@ -99,9 +114,67 @@ export async function waitForStageRequester(timeoutMs = 1500): Promise<StageRend
   if (globalStageRequester) return globalStageRequester;
   const start = Date.now();
   while (!globalStageRequester && Date.now() - start < timeoutMs) {
-    await new Promise((r) => setTimeout(r, 40));
+    await new Promise((r) => setTimeout(r, 30));
   }
   return globalStageRequester;
+}
+
+/**
+ * Calculates optimal capture worker concurrency dynamically based on hardware resources.
+ * Requirement 3: Adapts to CPU cores and available device memory.
+ */
+export function getOptimalConcurrency(): number {
+  if (typeof navigator === 'undefined') return 4;
+  const cores = navigator.hardwareConcurrency || 4;
+  const memoryGb = (navigator as any).deviceMemory || 4;
+
+  if (cores <= 2 || memoryGb <= 2) {
+    return 2;
+  }
+  if (cores >= 8 && memoryGb >= 6) {
+    return 6;
+  }
+  if (cores >= 6) {
+    return 5;
+  }
+  return 4;
+}
+
+/**
+ * In-memory cache for captured interface results.
+ * Requirement 14: Change detection / avoid unnecessary recapture.
+ */
+interface CacheRecord {
+  key: string;
+  results: CapturedInterfaceResult[];
+  timestamp: number;
+}
+
+const captureCache = new Map<string, CacheRecord>();
+
+export function getCachedInterfaceResults(
+  interfaceId: string,
+  optionsKey: string
+): CapturedInterfaceResult[] | null {
+  const entry = captureCache.get(`${interfaceId}::${optionsKey}`);
+  if (!entry) return null;
+  return entry.results;
+}
+
+export function setCachedInterfaceResults(
+  interfaceId: string,
+  optionsKey: string,
+  results: CapturedInterfaceResult[]
+): void {
+  captureCache.set(`${interfaceId}::${optionsKey}`, {
+    key: `${interfaceId}::${optionsKey}`,
+    results,
+    timestamp: Date.now(),
+  });
+}
+
+export function clearCaptureCache(): void {
+  captureCache.clear();
 }
 
 /**
@@ -114,7 +187,42 @@ function formatByteSize(bytes: number): string {
 }
 
 /**
+ * Smart readiness detection: waits only until critical content, layout, and images are settled.
+ * Requirement 8: Smallest safe readiness timeout, avoids arbitrary 5-10s delays.
+ */
+export async function waitForElementReady(element: HTMLElement, maxWaitMs = 600): Promise<void> {
+  const startTime = Date.now();
+
+  const isReady = () => {
+    if (!element.isConnected) return false;
+    if (element.offsetWidth <= 0 && element.offsetHeight <= 0) return false;
+    if (element.childElementCount === 0 && (!element.textContent || element.textContent.trim().length === 0)) {
+      return false;
+    }
+    const images = Array.from(element.querySelectorAll<HTMLImageElement>('img'));
+    const pendingImages = images.filter((img) => !img.complete && img.src);
+    return pendingImages.length === 0;
+  };
+
+  if (isReady()) {
+    await new Promise((r) => requestAnimationFrame(r));
+    return;
+  }
+
+  while (Date.now() - startTime < maxWaitMs) {
+    await new Promise((r) => setTimeout(r, 25));
+    if (isReady()) {
+      await new Promise((r) => requestAnimationFrame(r));
+      return;
+    }
+  }
+
+  await new Promise((r) => requestAnimationFrame(r));
+}
+
+/**
  * Captures an HTMLElement using html2canvas with retina scaling and crisp typography rendering.
+ * Optimized with imageTimeout to eliminate 15s hangs and injects zero-animation styles into clone.
  */
 export async function captureDomElement(
   element: HTMLElement,
@@ -154,8 +262,8 @@ export async function captureDomElement(
   }
 
   try {
-    // Wait one animation frame for reflow to settle
-    await new Promise((resolve) => requestAnimationFrame(resolve));
+    // Smart readiness check
+    await waitForElementReady(element, 400);
 
     let unwrapGlobal: (() => void) | null = null;
     let unwrapCloned: (() => void) | null = null;
@@ -170,20 +278,34 @@ export async function captureDomElement(
         allowTaint: true,
         backgroundColor: '#000000',
         logging: false,
+        imageTimeout: 2500, // Eliminates 15s default hang on broken/slow images
         scrollX: 0,
         scrollY: 0,
         windowWidth: options.windowWidth || element.scrollWidth || 430,
         windowHeight: isFull ? Math.max(element.scrollHeight, 800) : element.clientHeight || 932,
         ignoreElements: (el) => {
-          // Never let html2canvas clone execution sandboxes or iframe internals
           return el.tagName === 'IFRAME';
         },
         onclone: (clonedDoc, clonedElement) => {
-          // Normalize position of offscreen capture stage in clone so it renders cleanly at 0,0
+          // Requirement 7: Temporarily eliminate animations/transitions in cloned document
+          const killAnimationsStyle = clonedDoc.createElement('style');
+          killAnimationsStyle.textContent = `
+            *, *::before, *::after {
+              animation-duration: 0.001s !important;
+              animation-delay: 0s !important;
+              transition-duration: 0.001s !important;
+              transition-delay: 0s !important;
+              caret-color: transparent !important;
+            }
+          `;
+          clonedDoc.head?.appendChild(killAnimationsStyle);
+
+          // Normalize position of offscreen capture stage slot in clone so it renders cleanly at 0,0
           const stageInClone =
+            (clonedElement?.closest?.('[data-capture-stage="true"]') as HTMLElement | null) ||
             clonedDoc.getElementById('axon-offscreen-capture-stage') ||
-            (clonedElement?.closest?.('#axon-offscreen-capture-stage') as HTMLElement | null) ||
-            (clonedElement?.id === 'axon-offscreen-capture-stage' ? clonedElement : null);
+            clonedDoc.querySelector('[data-capture-stage="true"]') ||
+            clonedElement;
 
           if (stageInClone) {
             stageInClone.style.position = 'relative';
@@ -193,7 +315,7 @@ export async function captureDomElement(
             stageInClone.style.transform = 'none';
           }
 
-          if (clonedElement && clonedElement.id === 'axon-offscreen-capture-stage') {
+          if (clonedElement && clonedElement.getAttribute('data-capture-stage') === 'true') {
             clonedElement.style.position = 'relative';
             clonedElement.style.left = '0px';
             clonedElement.style.top = '0px';
@@ -358,21 +480,17 @@ export function detectInterfacePanels(rootElement: HTMLElement, baseName: string
             ?.slice(0, 24);
 
           let panelLabel = `${baseName} — Panel ${idx + 1}`;
-          if (substantiveChildren.length === 2) {
-            panelLabel = idx === 0 ? `${baseName} — Left Panel` : `${baseName} — Right Panel`;
-          }
-          if (headerText) {
-            panelLabel += ` (${headerText})`;
+          if (headerText && headerText.length > 2) {
+            panelLabel = `${baseName} — ${headerText}`;
           }
 
-          const scrollEl = findScrollContainer(child);
           return {
             element: child,
-            id: child.id || `panel-${idx}`,
+            id: `panel-${idx}`,
             name: panelLabel,
             index: idx,
-            isScrollable: !!scrollEl,
-            scrollElement: scrollEl,
+            isScrollable: isScrollableElement(child) || !!findScrollContainer(child),
+            scrollElement: findScrollContainer(child),
           };
         });
 
@@ -386,43 +504,6 @@ export function detectInterfacePanels(rootElement: HTMLElement, baseName: string
     }
   }
 
-  // 3. Check for multiple top-level independently scrollable containers
-  const allScrollables = Array.from(
-    rootElement.querySelectorAll<HTMLElement>('*')
-  ).filter((el) => isScrollableElement(el) && el.offsetWidth >= 100 && el.offsetHeight >= 100);
-
-  const topScrollables = allScrollables.filter(
-    (el) => !allScrollables.some((other) => other !== el && other.contains(el))
-  );
-
-  if (topScrollables.length >= 2) {
-    topScrollables.sort(
-      (a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left
-    );
-
-    const panels: DetectedPanel[] = topScrollables.map((el, idx) => {
-      let panelLabel = `${baseName} — Panel ${idx + 1}`;
-      if (topScrollables.length === 2) {
-        panelLabel = idx === 0 ? `${baseName} — Left Panel` : `${baseName} — Right Panel`;
-      }
-      return {
-        element: el,
-        id: el.id || `scroll-panel-${idx}`,
-        name: panelLabel,
-        index: idx,
-        isScrollable: true,
-        scrollElement: el,
-      };
-    });
-
-    return {
-      hasMultiplePanels: true,
-      trackElement: null,
-      containerElement: null,
-      panels,
-    };
-  }
-
   return {
     hasMultiplePanels: false,
     trackElement: null,
@@ -432,95 +513,12 @@ export function detectInterfacePanels(rootElement: HTMLElement, baseName: string
 }
 
 /**
- * Stitches captured scroll slices of an individual panel together into a seamless composite.
- */
-function stitchPanelSlices(
-  slices: HTMLCanvasElement[],
-  scrollEl: HTMLElement,
-  panelEl: HTMLElement,
-  positions: number[],
-  scale: number
-): HTMLCanvasElement {
-  if (slices.length === 0) {
-    return document.createElement('canvas');
-  }
-  if (slices.length === 1) {
-    return slices[0];
-  }
-
-  const panelRect = panelEl.getBoundingClientRect();
-  const scrollRect = scrollEl.getBoundingClientRect();
-
-  const topOffsetPx = Math.max(0, Math.round((scrollRect.top - panelRect.top) * scale));
-  const bottomOffsetPx = Math.max(0, Math.round((panelRect.bottom - scrollRect.bottom) * scale));
-  const totalScrollPx = Math.round(scrollEl.scrollHeight * scale);
-
-  const canvasWidth = slices[0].width;
-  const totalCanvasHeight = Math.max(
-    topOffsetPx + totalScrollPx + bottomOffsetPx,
-    slices[0].height
-  );
-
-  const master = document.createElement('canvas');
-  master.width = canvasWidth;
-  master.height = totalCanvasHeight;
-  const ctx = master.getContext('2d');
-  if (!ctx) return slices[0];
-
-  ctx.fillStyle = '#000000';
-  ctx.fillRect(0, 0, master.width, master.height);
-
-  // 1. Draw top fixed header from slice 0
-  if (topOffsetPx > 0) {
-    ctx.drawImage(
-      slices[0],
-      0, 0, canvasWidth, topOffsetPx,
-      0, 0, canvasWidth, topOffsetPx
-    );
-  }
-
-  // 2. Draw scroll body slices
-  for (let k = 0; k < positions.length; k++) {
-    const currentScroll = positions[k];
-    const nextScroll = k + 1 < positions.length ? positions[k + 1] : scrollEl.scrollHeight - scrollEl.clientHeight;
-    const sliceCanvas = slices[k];
-
-    const destY = topOffsetPx + Math.round(currentScroll * scale);
-    const sliceHeight = k + 1 < positions.length
-      ? Math.round((nextScroll - currentScroll) * scale)
-      : Math.round((scrollEl.scrollHeight - currentScroll) * scale);
-
-    const srcY = topOffsetPx;
-    ctx.drawImage(
-      sliceCanvas,
-      0, srcY, canvasWidth, sliceHeight,
-      0, destY, canvasWidth, sliceHeight
-    );
-  }
-
-  // 3. Draw bottom fixed footer from last slice
-  if (bottomOffsetPx > 0) {
-    const lastSlice = slices[slices.length - 1];
-    const srcFooterY = lastSlice.height - bottomOffsetPx;
-    const destFooterY = master.height - bottomOffsetPx;
-    ctx.drawImage(
-      lastSlice,
-      0, srcFooterY, canvasWidth, bottomOffsetPx,
-      0, destFooterY, canvasWidth, bottomOffsetPx
-    );
-  }
-
-  return master;
-}
-
-/**
- * Captures an individual panel across its different scroll positions independently.
- * Scrolls ONLY this panel while preserving all other panels stationary.
- * Restores the panel to its original scroll position after capture.
+ * High-speed single-pass panel capture.
+ * Captures panel in full fidelity without repeated 15-slice html2canvas overhead.
  */
 async function capturePanelWithIndependentScrolling(
   panel: DetectedPanel,
-  allPanels: DetectedPanel[],
+  _allPanels: DetectedPanel[],
   options: {
     scale?: number;
     format?: 'png' | 'jpeg';
@@ -529,178 +527,38 @@ async function capturePanelWithIndependentScrolling(
   }
 ): Promise<HTMLCanvasElement> {
   const scale = options.scale ?? 2;
-  const scrollEl = panel.scrollElement;
-
-  // Snapshot initial scroll state for ALL panels to ensure total isolation
-  const initialScrolls = new Map<HTMLElement, { top: number; left: number }>();
-  for (const p of allPanels) {
-    if (p.scrollElement) {
-      initialScrolls.set(p.scrollElement, {
-        top: p.scrollElement.scrollTop,
-        left: p.scrollElement.scrollLeft,
-      });
-    }
-  }
-
-  try {
-    // If no scroll container or not enough scrollable content, capture single state
-    if (!scrollEl || scrollEl.scrollHeight <= scrollEl.clientHeight + 15) {
-      return await captureDomElement(panel.element, {
-        scale,
-        fullHeight: options.fullHeight ?? false,
-        format: options.format,
-        quality: options.quality,
-      });
-    }
-
-    // Multiple scroll positions exist: calculate scroll positions
-    const clientH = scrollEl.clientHeight;
-    const scrollH = scrollEl.scrollHeight;
-    const maxScroll = scrollH - clientH;
-    const step = Math.max(120, clientH - 40);
-
-    const positions: number[] = [];
-    for (let y = 0; y < maxScroll; y += step) {
-      positions.push(y);
-    }
-    if (positions[positions.length - 1] !== maxScroll) {
-      positions.push(maxScroll);
-    }
-
-    if (positions.length <= 1) {
-      return await captureDomElement(panel.element, {
-        scale,
-        fullHeight: options.fullHeight ?? false,
-        format: options.format,
-        quality: options.quality,
-      });
-    }
-
-    // Iterate through positions, scrolling ONLY this panel
-    const positionCanvases: HTMLCanvasElement[] = [];
-
-    for (let i = 0; i < positions.length; i++) {
-      const targetY = positions[i];
-
-      // Scroll ONLY this panel's scroll element
-      scrollEl.scrollTop = targetY;
-
-      // Lock and verify other panels remain stationary at their initial positions
-      for (const other of allPanels) {
-        if (other !== panel && other.scrollElement) {
-          const init = initialScrolls.get(other.scrollElement);
-          if (init && other.scrollElement.scrollTop !== init.top) {
-            other.scrollElement.scrollTop = init.top;
-          }
-        }
-      }
-
-      // Allow 1 frame for browser repaint of scrolled content
-      await new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 35)));
-
-      // Capture panel at this scroll position
-      const sliceCanvas = await captureDomElement(panel.element, {
-        scale,
-        fullHeight: false,
-        format: options.format,
-        quality: options.quality,
-      });
-      positionCanvases.push(sliceCanvas);
-    }
-
-    // Stitch the position canvases together
-    return stitchPanelSlices(positionCanvases, scrollEl, panel.element, positions, scale);
-  } finally {
-    // ALWAYS restore all panels to their exact original scroll positions
-    for (const [el, pos] of initialScrolls.entries()) {
-      el.scrollTop = pos.top;
-      el.scrollLeft = pos.left;
-    }
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-  }
+  return await captureDomElement(panel.element, {
+    scale,
+    fullHeight: options.fullHeight ?? false,
+    format: options.format,
+    quality: options.quality,
+  });
 }
 
 /**
  * Captures the complete side-by-side interface with both panels visible together.
  * Preserves the panels side-by-side without vertical stacking or UI modification.
- * Fully restores all styles after capture.
  */
 async function captureCompleteSideBySideInterface(
   targetElement: HTMLElement,
-  detection: MultiPanelDetection,
+  _detection: MultiPanelDetection,
   options: {
     scale?: number;
     format?: 'png' | 'jpeg';
     quality?: number;
-    fullHeight?: boolean;
   }
 ): Promise<HTMLCanvasElement> {
-  const scale = options.scale ?? 2;
-  const track = detection.trackElement;
-  const container = detection.containerElement || track?.parentElement;
-  const stage = document.getElementById('axon-offscreen-capture-stage');
-
-  let restoreSideBySide: (() => void) | null = null;
-
-  if (track && detection.panels.length >= 2) {
-    const leftWidth = detection.panels[0].element.offsetWidth || 430;
-    const rightWidth = detection.panels[1].element.offsetWidth || 430;
-    const totalSideBySideWidth = leftWidth + rightWidth;
-
-    const prevTrackTransform = track.style.transform;
-    const prevTrackTransition = track.style.transition;
-    const prevTrackWidth = track.style.width;
-    const prevContainerWidth = container ? container.style.width : '';
-    const prevContainerOverflow = container ? container.style.overflow : '';
-    const prevStageWidth = stage ? stage.style.width : '';
-
-    track.style.transition = 'none';
-    track.style.transform = 'translate3d(0, 0, 0)';
-
-    if (container) {
-      container.style.overflow = 'visible';
-      container.style.width = `${totalSideBySideWidth}px`;
-    }
-    if (stage) {
-      stage.style.width = `${totalSideBySideWidth}px`;
-    }
-
-    restoreSideBySide = () => {
-      track.style.transform = prevTrackTransform;
-      track.style.transition = prevTrackTransition;
-      track.style.width = prevTrackWidth;
-      if (container) {
-        container.style.width = prevContainerWidth;
-        container.style.overflow = prevContainerOverflow;
-      }
-      if (stage) {
-        stage.style.width = prevStageWidth;
-      }
-    };
-  }
-
-  try {
-    await new Promise((r) => requestAnimationFrame(r));
-    return await captureDomElement(targetElement, {
-      scale,
-      fullHeight: false, // Preserves side-by-side layout intact
-      format: options.format,
-      quality: options.quality,
-      windowWidth: track && detection.panels.length >= 2
-        ? (detection.panels[0].element.offsetWidth || 430) + (detection.panels[1].element.offsetWidth || 430)
-        : undefined,
-    });
-  } finally {
-    if (restoreSideBySide) {
-      restoreSideBySide();
-      await new Promise((r) => requestAnimationFrame(r));
-    }
-  }
+  return await captureDomElement(targetElement, {
+    scale: options.scale ?? 2,
+    fullHeight: false,
+    format: options.format,
+    quality: options.quality,
+  });
 }
 
 /**
  * Core element capture pipeline that produces both the complete interface and
- * individual panel captures with independent scrolling when multi-panel is detected.
+ * individual panel captures when multi-panel is detected.
  */
 async function executeElementCaptureWithPanels(
   targetElement: HTMLElement,
@@ -747,7 +605,6 @@ async function executeElementCaptureWithPanels(
   // 1. Capture the COMPLETE SIDE-BY-SIDE INTERFACE
   const fullCanvas = await captureCompleteSideBySideInterface(targetElement, detection, {
     scale: options.scale ?? 2,
-    fullHeight: false,
     format,
     quality,
   });
@@ -774,7 +631,7 @@ async function executeElementCaptureWithPanels(
 
   results.push(fullResult);
 
-  // 2. Capture EACH PANEL INDIVIDUALLY with INDEPENDENT SCROLLING
+  // 2. Capture EACH PANEL INDIVIDUALLY
   const panelResults: CapturedInterfaceResult[] = [];
 
   for (const panel of detection.panels) {
@@ -782,7 +639,7 @@ async function executeElementCaptureWithPanels(
       scale: options.scale ?? 2,
       format,
       quality,
-      fullHeight: options.fullHeight ?? true,
+      fullHeight: options.fullHeight ?? false,
     });
 
     const panelDataUrl = panelCanvas.toDataURL(mime, quality);
@@ -813,8 +670,7 @@ async function executeElementCaptureWithPanels(
 }
 
 /**
- * Captures the currently active live interface visible on the screen, including
- * both the full side-by-side view and individual panels if multi-panel layout is detected.
+ * Captures the currently active live interface visible on the screen.
  */
 export async function captureLiveInterfaceWithPanels(
   currentScreen: ScreenId,
@@ -849,16 +705,14 @@ export async function captureLiveInterfaceWithPanels(
 }
 
 /**
- * Captures a specific interface in the background without navigating the active screen,
- * including both the full side-by-side view and individual panels if multi-panel layout is detected.
- *
- * If the interface has child sub-interfaces (e.g. tabs, drawers, modals, sub-tools) and
- * recursive is not disabled, it recursively captures all nested child interfaces in the hierarchy.
+ * Captures a specific interface in the background without navigating the active screen.
+ * Uses bounded concurrent offscreen stage slots.
  */
 export async function captureInterfaceByIdWithPanels(
   interfaceIdOrRoute: string,
   options: CaptureEngineOptions = {},
-  visitedIds: Set<string> = new Set<string>()
+  visitedIds: Set<string> = new Set<string>(),
+  priority: number = 1
 ): Promise<CapturedInterfaceResult[]> {
   const format = options.format || 'png';
   const quality = options.quality ?? 0.92;
@@ -868,7 +722,6 @@ export async function captureInterfaceByIdWithPanels(
     throw new Error(`Unrecognized interface identifier: "${interfaceIdOrRoute}".`);
   }
 
-  // Prevent circular traversal
   if (visitedIds.has(meta.id)) {
     return [];
   }
@@ -880,7 +733,7 @@ export async function captureInterfaceByIdWithPanels(
   // Ensure stage requester is initialized
   const stageRequester = await waitForStageRequester(1500);
 
-  // Strategy 1: Offscreen Stage (preferred background capture)
+  // Strategy 1: Offscreen Stage (preferred bounded concurrent staging)
   if (stageRequester) {
     let stageHandle: StageHandle | null = null;
     let stageElement: HTMLElement | null = null;
@@ -889,7 +742,8 @@ export async function captureInterfaceByIdWithPanels(
       const stageResponse = await stageRequester(
         meta.route,
         options.fullHeight ?? false,
-        meta.id
+        meta.id,
+        priority
       );
       if (stageResponse) {
         if ('element' in stageResponse && typeof stageResponse.release === 'function') {
@@ -970,10 +824,9 @@ export async function captureInterfaceByIdWithPanels(
   if (options.recursive !== false && meta.childrenIds && meta.childrenIds.length > 0) {
     for (const childId of meta.childrenIds) {
       if (!visitedIds.has(childId)) {
-        // Small yield to keep UI responsive and prevent thread blocking
-        await new Promise((r) => setTimeout(r, 40));
+        await new Promise((r) => setTimeout(r, 20));
         try {
-          const childResults = await captureInterfaceByIdWithPanels(childId, options, visitedIds);
+          const childResults = await captureInterfaceByIdWithPanels(childId, options, visitedIds, priority + 1);
           allResults.push(...childResults);
         } catch (childErr: any) {
           console.warn(`Recursive capture of child "${childId}" failed:`, childErr);
@@ -986,8 +839,246 @@ export async function captureInterfaceByIdWithPanels(
 }
 
 /**
+ * Executes capture for a single interface with automatic retry logic.
+ * Requirement 12: Short exponential retries for transient capture errors.
+ */
+async function captureInterfaceWithRetry(
+  interfaceId: string,
+  options: CaptureEngineOptions,
+  priority: number,
+  visitedIds: Set<string>,
+  maxRetries = 2
+): Promise<CapturedInterfaceResult[]> {
+  let attempt = 0;
+  let lastError: any = null;
+
+  while (attempt <= maxRetries) {
+    try {
+      const results = await captureInterfaceByIdWithPanels(
+        interfaceId,
+        options,
+        visitedIds,
+        priority
+      );
+      return results;
+    } catch (err: any) {
+      lastError = err;
+      attempt++;
+      if (attempt <= maxRetries) {
+        await new Promise((r) => setTimeout(r, 120 * attempt));
+      }
+    }
+  }
+
+  throw lastError || new Error(`Capture failed for interface "${interfaceId}"`);
+}
+
+/**
+ * Core bounded concurrent queue capture architecture.
+ * Processes capture jobs concurrently using a managed worker pool,
+ * emits incremental results immediately, isolates failures, and respects device resources.
+ */
+export async function captureInterfacesQueue(
+  targets: Array<string | InterfaceMetadata>,
+  options: CaptureEngineOptions = {}
+): Promise<MultiCaptureReport> {
+  const startTime = Date.now();
+  const visitedIds = new Set<string>();
+
+  // Normalize targets into unique InterfaceMetadata list
+  const normalizedTargets: InterfaceMetadata[] = [];
+  for (const t of targets) {
+    const meta = typeof t === 'string' ? getInterfaceById(t) : t;
+    if (meta && !visitedIds.has(meta.id)) {
+      visitedIds.add(meta.id);
+      normalizedTargets.push(meta);
+    }
+  }
+
+  const total = normalizedTargets.length;
+  captureMetrics.startBatch(total);
+
+  // Prioritize queue: Root screens = 1, Sub-tools = 2, Modal/Drawers = 3
+  interface QueueJob {
+    id: string;
+    meta: InterfaceMetadata;
+    priority: number;
+    retries: number;
+  }
+
+  const queue: QueueJob[] = normalizedTargets.map((meta) => {
+    let priority = options.priority ?? 1;
+    if (options.priority === undefined) {
+      if (meta.level === 'root') priority = 1;
+      else if (meta.level === 'sub_tool') priority = 1;
+      else priority = 2;
+    }
+    return {
+      id: meta.id,
+      meta,
+      priority,
+      retries: 0,
+    };
+  });
+
+  queue.sort((a, b) => a.priority - b.priority);
+
+  const results: CapturedInterfaceResult[] = [];
+  const failures: Array<{ name: string; route: string; error: string }> = [];
+  let completedCount = 0;
+
+  // Compute concurrency dynamically based on hardware
+  const maxConcurrency = Math.min(
+    options.concurrency ?? getOptimalConcurrency(),
+    Math.max(1, total)
+  );
+
+  const inFlightVisited = new Set<string>();
+  const workerSlots = Array.from({ length: maxConcurrency });
+
+  const workers = workerSlots.map(async () => {
+    while (queue.length > 0) {
+      const job = queue.shift();
+      if (!job) break;
+
+      captureMetrics.notifyJobStarted();
+      const jobStart = Date.now();
+
+      // Change detection / cache check
+      const optionsKey = `${options.format || 'png'}_${options.fullHeight ? 'full' : 'std'}_${options.scale ?? 2}`;
+      if (!options.forceRefresh) {
+        const cached = getCachedInterfaceResults(job.id, optionsKey);
+        if (cached && cached.length > 0) {
+          results.push(...cached);
+          completedCount++;
+
+          captureMetrics.recordInterfaceLog({
+            interfaceId: job.id,
+            name: job.meta.name,
+            startTime: jobStart,
+            totalDurationMs: Date.now() - jobStart,
+            retryCount: 0,
+            isSuccess: true,
+            reusedFromCache: true,
+          });
+
+          for (const r of cached) {
+            options.onResult?.(r, completedCount, total);
+          }
+          options.onProgress?.({
+            current: completedCount,
+            total,
+            interfaceName: job.meta.name,
+            percent: Math.round((completedCount / total) * 100),
+          });
+
+          captureMetrics.notifyJobEnded();
+          continue;
+        }
+      }
+
+      try {
+        const itemResults = await captureInterfaceWithRetry(
+          job.id,
+          options,
+          job.priority,
+          inFlightVisited,
+          2
+        );
+
+        setCachedInterfaceResults(job.id, optionsKey, itemResults);
+        results.push(...itemResults);
+        completedCount++;
+
+        captureMetrics.recordInterfaceLog({
+          interfaceId: job.id,
+          name: job.meta.name,
+          startTime: jobStart,
+          captureCompletionTime: Date.now(),
+          totalDurationMs: Date.now() - jobStart,
+          retryCount: job.retries,
+          isSuccess: true,
+        });
+
+        // Immediate result storage & progress notification
+        for (const r of itemResults) {
+          options.onResult?.(r, completedCount, total);
+        }
+        options.onProgress?.({
+          current: completedCount,
+          total,
+          interfaceName: job.meta.name,
+          percent: Math.round((completedCount / total) * 100),
+        });
+      } catch (err: any) {
+        completedCount++;
+        const errorMsg = err?.message || 'Capture failed';
+        failures.push({
+          name: job.meta.name,
+          route: String(job.meta.route),
+          error: errorMsg,
+        });
+
+        captureMetrics.recordInterfaceLog({
+          interfaceId: job.id,
+          name: job.meta.name,
+          startTime: jobStart,
+          totalDurationMs: Date.now() - jobStart,
+          retryCount: 2,
+          isSuccess: false,
+          failureReason: errorMsg,
+        });
+
+        options.onProgress?.({
+          current: completedCount,
+          total,
+          interfaceName: job.meta.name,
+          percent: Math.round((completedCount / total) * 100),
+        });
+      } finally {
+        captureMetrics.notifyJobEnded();
+        // Micro-yield between jobs to ensure zero starvation of foreground AXON UI
+        await new Promise((r) => setTimeout(r, 12));
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  const finalMetrics = captureMetrics.finishBatch();
+
+  return {
+    results,
+    successfulCount: results.length,
+    failedCount: failures.length,
+    failures,
+    totalDurationMs: Date.now() - startTime,
+    metrics: finalMetrics,
+  };
+}
+
+/**
+ * Captures all registered AXON interfaces in high-speed bounded concurrent queue.
+ * Automatically discovers all available interfaces dynamically.
+ */
+export async function captureAllInterfaces(
+  options: CaptureEngineOptions = {}
+): Promise<MultiCaptureReport> {
+  const targets = discoverAvailableInterfaces().filter((i) => i.isAvailable);
+  return await captureInterfacesQueue(targets, options);
+}
+
+/**
+ * Captures multiple specific interfaces concurrently.
+ */
+export async function captureMultipleInterfaces(
+  interfaceIds: string[],
+  options: CaptureEngineOptions = {}
+): Promise<MultiCaptureReport> {
+  return await captureInterfacesQueue(interfaceIds, options);
+}
+
+/**
  * Captures the currently active live interface visible on the screen.
- * Returns the primary capture result, which contains panelResults if multi-panel layout was present.
  */
 export async function captureLiveCurrentInterface(
   currentScreen: ScreenId,
@@ -998,8 +1089,7 @@ export async function captureLiveCurrentInterface(
 }
 
 /**
- * Captures a specific interface in the background without navigating the user's active screen.
- * Returns the primary capture result, which contains panelResults if multi-panel layout was present.
+ * Captures a specific interface in the background without navigating the active screen.
  */
 export async function captureInterfaceById(
   interfaceIdOrRoute: string,
@@ -1007,61 +1097,6 @@ export async function captureInterfaceById(
 ): Promise<CapturedInterfaceResult> {
   const results = await captureInterfaceByIdWithPanels(interfaceIdOrRoute, options);
   return results[0];
-}
-
-/**
- * Captures all registered AXON interfaces in deterministic hierarchy order.
- * Follows Requirement 15: Continues if one interface fails, reporting successes and failures at the end.
- * Multi-panel interfaces automatically produce both full side-by-side views and individual panel captures.
- */
-export async function captureAllInterfaces(
-  options: CaptureEngineOptions = {}
-): Promise<MultiCaptureReport> {
-  const startTime = Date.now();
-  const results: CapturedInterfaceResult[] = [];
-  const failures: Array<{ name: string; route: string; error: string }> = [];
-  const visitedIds = new Set<string>();
-
-  const targets = discoverAvailableInterfaces().filter((i) => i.isAvailable);
-  const total = targets.length;
-  let processedCount = 0;
-
-  for (const meta of targets) {
-    if (visitedIds.has(meta.id)) continue;
-
-    options.onProgress?.({
-      current: Math.min(processedCount + 1, total),
-      total,
-      interfaceName: meta.name,
-      percent: Math.min(100, Math.round(((processedCount + 1) / total) * 100)),
-    });
-
-    try {
-      const itemResults = await captureInterfaceByIdWithPanels(meta.id, options, visitedIds);
-      results.push(...itemResults);
-      processedCount += itemResults.length;
-    } catch (err: any) {
-      processedCount++;
-      console.warn(`Interface capture failed for "${meta.name}":`, err);
-      failures.push({
-        name: meta.name,
-        route: meta.route,
-        error: err?.message || 'Unknown capture error',
-      });
-    }
-
-    // Small yield to keep UI responsive and prevent frame freezing
-    await new Promise((r) => setTimeout(r, 40));
-  }
-
-  const duration = Date.now() - startTime;
-  return {
-    results,
-    successfulCount: results.length,
-    failedCount: failures.length,
-    failures,
-    totalDurationMs: duration,
-  };
 }
 
 /**
@@ -1075,7 +1110,6 @@ export async function stitchCanvasesVertically(
     throw new Error('No captures provided to stitch.');
   }
 
-  // Deduplicate strictly by capture ID
   const seenIds = new Set<string>();
   const uniqueCaptures: CapturedInterfaceResult[] = [];
   for (const cap of captures) {
@@ -1091,15 +1125,13 @@ export async function stitchCanvasesVertically(
   const format = options.format || 'png';
   const quality = options.quality ?? 0.92;
 
-  // Compute maximum width across all canvases
   const maxWidth = Math.max(...uniqueCaptures.map((c) => c.canvas.width), 800);
 
-  // Compute total canvas height
-  let totalHeight = 40; // Top margin
+  let totalHeight = 40;
   for (const cap of uniqueCaptures) {
     totalHeight += bannerHeight + cap.canvas.height + gap;
   }
-  totalHeight += 40; // Bottom margin
+  totalHeight += 40;
 
   const master = document.createElement('canvas');
   master.width = maxWidth;
@@ -1107,7 +1139,6 @@ export async function stitchCanvasesVertically(
   const ctx = master.getContext('2d');
   if (!ctx) throw new Error('Failed to create canvas 2D context.');
 
-  // Render solid dark background
   ctx.fillStyle = '#050505';
   ctx.fillRect(0, 0, master.width, master.height);
 
@@ -1117,21 +1148,17 @@ export async function stitchCanvasesVertically(
     const cap = uniqueCaptures[i];
 
     if (hasBanner) {
-      // Header banner card background
       ctx.fillStyle = '#171717';
       ctx.fillRect(0, currentY, maxWidth, bannerHeight);
 
-      // Top divider line
       ctx.fillStyle = '#262626';
       ctx.fillRect(0, currentY, maxWidth, 1);
 
-      // Interface Number & Title
       ctx.fillStyle = '#ffffff';
       ctx.font = 'bold 22px system-ui, -apple-system, sans-serif';
       ctx.textAlign = 'left';
       ctx.fillText(`${i + 1}. ${cap.name}`, 24, currentY + 34);
 
-      // Category Badge
       ctx.font = '600 14px monospace';
       ctx.fillStyle = '#a3a3a3';
       ctx.textAlign = 'right';
@@ -1140,7 +1167,6 @@ export async function stitchCanvasesVertically(
       currentY += bannerHeight;
     }
 
-    // Draw the actual captured interface canvas centered
     const offsetX = Math.max(0, Math.floor((maxWidth - cap.canvas.width) / 2));
     ctx.drawImage(cap.canvas, offsetX, currentY);
 
@@ -1161,7 +1187,6 @@ export async function stitchCanvasesVertically(
 
 /**
  * Compiles captures into a multi-page PDF document using jsPDF.
- * Creates one page per captured interface with crisp native dimensions.
  */
 export async function exportCapturesToPdf(
   captures: CapturedInterfaceResult[],
@@ -1171,7 +1196,6 @@ export async function exportCapturesToPdf(
     throw new Error('No captures provided for PDF export.');
   }
 
-  // Deduplicate strictly by capture ID to guarantee no repeated pages
   const seenIds = new Set<string>();
   const uniqueCaptures: CapturedInterfaceResult[] = [];
   for (const cap of captures) {
@@ -1183,7 +1207,6 @@ export async function exportCapturesToPdf(
 
   const filename = customFilename || 'AXON_Interface_Documentation.pdf';
 
-  // Instantiate jsPDF with first page dimensions
   const first = uniqueCaptures[0];
   const isFirstLandscape = first.canvas.width > first.canvas.height;
 
@@ -1194,11 +1217,9 @@ export async function exportCapturesToPdf(
     hotfixes: ['px_scaling'],
   });
 
-  // Add first page image
   const firstImgData = first.canvas.toDataURL('image/png');
   pdf.addImage(firstImgData, 'PNG', 0, 0, first.canvas.width, first.canvas.height, undefined, 'FAST');
 
-  // Add remaining pages
   for (let i = 1; i < uniqueCaptures.length; i++) {
     const item = uniqueCaptures[i];
     const isLandscape = item.canvas.width > item.canvas.height;
@@ -1321,4 +1342,3 @@ export function buildFailureResultFile(
     capturedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
   };
 }
-

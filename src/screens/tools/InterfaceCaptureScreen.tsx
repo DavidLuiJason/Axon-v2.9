@@ -37,6 +37,7 @@ import {
   captureLiveInterfaceWithPanels,
   captureInterfaceByIdWithPanels,
   captureAllInterfaces,
+  captureMultipleInterfaces,
   stitchCanvasesVertically,
   exportCapturesToPdf,
   triggerCaptureDownload,
@@ -58,6 +59,7 @@ export const InterfaceCaptureScreen: React.FC = () => {
   const [selectedMultipleIds, setSelectedMultipleIds] = useState<string[]>(['axon', 'settings', 'tools']);
   const [captureType, setCaptureType] = useState<'visible' | 'full'>('full');
   const [exportFormat, setExportFormat] = useState<'png' | 'jpeg' | 'long_image' | 'pdf'>('png');
+  const [forceRecapture, setForceRecapture] = useState<boolean>(false);
 
   // Execution & Progress State
   const [isCapturing, setIsCapturing] = useState<boolean>(false);
@@ -177,100 +179,84 @@ export const InterfaceCaptureScreen: React.FC = () => {
           return;
         }
 
-        const results: CapturedInterfaceResult[] = [];
-        const failures: Array<{ name: string; route: string; error: string }> = [];
-        const files: GeneratedResultFile[] = [];
-        const total = selectedMultipleIds.length;
-        const visitedIds = new Set<string>();
+        setCapturedResults([]);
+        setGeneratedFiles([]);
 
-        for (let i = 0; i < total; i++) {
-          const id = selectedMultipleIds[i];
-          if (visitedIds.has(id)) continue;
-          const meta = getInterfaceById(id);
-          const name = meta?.name || id;
-
-          setProgress({
-            current: i + 1,
-            total,
-            interfaceName: name,
-            percent: Math.round(((i + 1) / total) * 100),
-          });
-
-          try {
-            const itemResults = await captureInterfaceByIdWithPanels(
-              id,
-              {
-                fullHeight: isFull,
-                format: imgFormat,
-              },
-              visitedIds
-            );
-            results.push(...itemResults);
-            for (const r of itemResults) {
-              files.push(buildResultFileFromCapture(r, imgFormat === 'jpeg' ? 'jpg' : 'png'));
-            }
-          } catch (err: any) {
-            failures.push({ name, route: id, error: err?.message || 'Failed to capture' });
-            files.push(buildFailureResultFile(name, id, err?.message || 'Failed to capture', meta?.category || 'Interface'));
-          }
-          await new Promise((r) => setTimeout(r, 40));
-        }
-
-        if (exportFormat === 'long_image' && results.length > 0) {
-          const longImg = await stitchCanvasesVertically(results, { format: imgFormat });
-          files.unshift(buildResultFileFromStitched(longImg, `Combined Interfaces (${results.length})`, 'Combined Long Image'));
-          triggerCaptureDownload(longImg.dataUrl, longImg.filename);
-          showToast(`Stitched & exported ${results.length} interfaces as Long Image`);
-        } else if (exportFormat === 'pdf' && results.length > 0) {
-          const pdfDoc = await exportCapturesToPdf(results, 'AXON_Interface_Documentation.pdf');
-          files.unshift(buildResultFileFromPdf(pdfDoc, `Interface Documentation (${results.length} Pages)`, 'Documentation PDF', 'all', results.length));
-          triggerCaptureDownload(pdfDoc.dataUrl, pdfDoc.filename);
-          showToast(`Exported ${results.length} interfaces as PDF document`);
-        } else {
-          showToast(`Captured ${results.length} interfaces`);
-        }
-
-        setCapturedResults(results);
-        setGeneratedFiles(files);
-        setMultiReport({
-          results,
-          successfulCount: results.length,
-          failedCount: failures.length,
-          failures,
-          totalDurationMs: 0,
-        });
-        setTimeout(() => resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
-      } else if (captureScope === 'all') {
-        const report = await captureAllInterfaces({
+        const report = await captureMultipleInterfaces(selectedMultipleIds, {
           fullHeight: isFull,
           format: imgFormat,
+          forceRefresh: forceRecapture,
           onProgress: (prog) => setProgress(prog),
+          onResult: (res) => {
+            const newFile = buildResultFileFromCapture(res, imgFormat === 'jpeg' ? 'jpg' : 'png');
+            setCapturedResults((prev) => [...prev, res]);
+            setGeneratedFiles((prev) => [...prev, newFile]);
+          },
         });
 
-        const files: GeneratedResultFile[] = [];
-        for (const res of report.results) {
-          files.push(buildResultFileFromCapture(res, imgFormat === 'jpeg' ? 'jpg' : 'png'));
-        }
-        for (const fail of report.failures) {
-          files.push(buildFailureResultFile(fail.name, fail.route, fail.error));
+        // Add failure placeholder files if any
+        if (report.failures.length > 0) {
+          const failFiles = report.failures.map((f) => buildFailureResultFile(f.name, f.route, f.error));
+          setGeneratedFiles((prev) => [...prev, ...failFiles]);
         }
 
         if (exportFormat === 'long_image' && report.results.length > 0) {
           const longImg = await stitchCanvasesVertically(report.results, { format: imgFormat });
-          files.unshift(buildResultFileFromStitched(longImg, `All AXON Interfaces (${report.results.length})`, 'Combined Long Image'));
+          const stitchedFile = buildResultFileFromStitched(longImg, `Combined Interfaces (${report.results.length})`, 'Combined Long Image');
+          setGeneratedFiles((prev) => [stitchedFile, ...prev]);
+          triggerCaptureDownload(longImg.dataUrl, longImg.filename);
+          showToast(`Stitched & exported ${report.results.length} interfaces as Long Image`);
+        } else if (exportFormat === 'pdf' && report.results.length > 0) {
+          const pdfDoc = await exportCapturesToPdf(report.results, 'AXON_Interface_Documentation.pdf');
+          const pdfFile = buildResultFileFromPdf(pdfDoc, `Interface Documentation (${report.results.length} Pages)`, 'Documentation PDF', 'all', report.results.length);
+          setGeneratedFiles((prev) => [pdfFile, ...prev]);
+          triggerCaptureDownload(pdfDoc.dataUrl, pdfDoc.filename);
+          showToast(`Exported ${report.results.length} interfaces as PDF document`);
+        } else {
+          showToast(`Captured ${report.successfulCount} interfaces (${(report.totalDurationMs / 1000).toFixed(1)}s)`);
+        }
+
+        setCapturedResults(report.results);
+        setMultiReport(report);
+        setTimeout(() => resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
+      } else if (captureScope === 'all') {
+        setCapturedResults([]);
+        setGeneratedFiles([]);
+
+        const report = await captureAllInterfaces({
+          fullHeight: isFull,
+          format: imgFormat,
+          forceRefresh: forceRecapture,
+          onProgress: (prog) => setProgress(prog),
+          onResult: (res) => {
+            const newFile = buildResultFileFromCapture(res, imgFormat === 'jpeg' ? 'jpg' : 'png');
+            setCapturedResults((prev) => [...prev, res]);
+            setGeneratedFiles((prev) => [...prev, newFile]);
+          },
+        });
+
+        if (report.failures.length > 0) {
+          const failFiles = report.failures.map((f) => buildFailureResultFile(f.name, f.route, f.error));
+          setGeneratedFiles((prev) => [...prev, ...failFiles]);
+        }
+
+        if (exportFormat === 'long_image' && report.results.length > 0) {
+          const longImg = await stitchCanvasesVertically(report.results, { format: imgFormat });
+          const stitchedFile = buildResultFileFromStitched(longImg, `All AXON Interfaces (${report.results.length})`, 'Combined Long Image');
+          setGeneratedFiles((prev) => [stitchedFile, ...prev]);
           triggerCaptureDownload(longImg.dataUrl, longImg.filename);
           showToast(`Stitched all ${report.results.length} interfaces as Long Image`);
         } else if (exportFormat === 'pdf' && report.results.length > 0) {
           const pdfDoc = await exportCapturesToPdf(report.results, 'AXON_Interface_Documentation.pdf');
-          files.unshift(buildResultFileFromPdf(pdfDoc, `AXON Interface Documentation (${report.results.length} Pages)`, 'Documentation PDF', 'all', report.results.length));
+          const pdfFile = buildResultFileFromPdf(pdfDoc, `AXON Interface Documentation (${report.results.length} Pages)`, 'Documentation PDF', 'all', report.results.length);
+          setGeneratedFiles((prev) => [pdfFile, ...prev]);
           triggerCaptureDownload(pdfDoc.dataUrl, pdfDoc.filename);
           showToast(`Exported all ${report.results.length} interfaces to PDF`);
         } else {
-          showToast(`All-interface capture complete (${report.successfulCount} captured)`);
+          showToast(`All-interface capture complete (${report.successfulCount} captured in ${(report.totalDurationMs / 1000).toFixed(1)}s)`);
         }
 
         setCapturedResults(report.results);
-        setGeneratedFiles(files);
         setMultiReport(report);
         setTimeout(() => resultsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
       }
@@ -280,6 +266,30 @@ export const InterfaceCaptureScreen: React.FC = () => {
     } finally {
       setIsCapturing(false);
       setProgress(null);
+    }
+  };
+
+  const handleRetrySingle = async (interfaceIdOrRoute: string, name: string) => {
+    try {
+      showToast(`Retrying capture for "${name}"...`);
+      const results = await captureInterfaceByIdWithPanels(interfaceIdOrRoute, {
+        fullHeight: captureType === 'full',
+        format: exportFormat === 'jpeg' ? 'jpeg' : 'png',
+      }, new Set<string>(), 0);
+
+      // Remove failure placeholder from generatedFiles and add successful file(s)
+      setGeneratedFiles((prev) => {
+        const filtered = prev.filter((f) => f.route !== interfaceIdOrRoute || f.status !== 'failed');
+        const newFiles = results.map((r) =>
+          buildResultFileFromCapture(r, exportFormat === 'jpeg' ? 'jpg' : 'png')
+        );
+        return [...filtered, ...newFiles];
+      });
+
+      setCapturedResults((prev) => [...prev, ...results]);
+      showToast(`Successfully captured "${name}"`);
+    } catch (err: any) {
+      showToast(`Retry failed for "${name}": ${err?.message || 'Error'}`);
     }
   };
 
@@ -563,6 +573,20 @@ export const InterfaceCaptureScreen: React.FC = () => {
           </div>
         </div>
 
+        {/* Force Recapture Cache Option */}
+        <div className="flex items-center justify-between px-1 text-[11px] text-neutral-400">
+          <label htmlFor="force-recapture-checkbox" className="flex items-center gap-1.5 cursor-pointer">
+            <input
+              id="force-recapture-checkbox"
+              type="checkbox"
+              checked={forceRecapture}
+              onChange={(e) => setForceRecapture(e.target.checked)}
+              className="w-3.5 h-3.5 rounded bg-neutral-900 border-neutral-700 text-white focus:ring-0 cursor-pointer"
+            />
+            <span>Bypass cache (Force full recapture)</span>
+          </label>
+        </div>
+
         {/* 3. Primary Action Button */}
         <div>
           <button
@@ -612,9 +636,9 @@ export const InterfaceCaptureScreen: React.FC = () => {
           </div>
         )}
 
-        {/* 5. Failure / Completion Report Callout (Requirement 15) */}
+        {/* 5. Failure / Completion Report Callout with Performance Metrics */}
         {multiReport && (
-          <div className="p-3 rounded-2xl bg-neutral-900/80 border border-neutral-800 space-y-1.5">
+          <div className="p-3 rounded-2xl bg-neutral-900/80 border border-neutral-800 space-y-2">
             <div className="flex items-center justify-between text-xs">
               <span className="font-bold text-white flex items-center gap-1.5">
                 <Check className="w-4 h-4 text-emerald-400" />
@@ -622,17 +646,52 @@ export const InterfaceCaptureScreen: React.FC = () => {
               </span>
               <span className="text-[11px] text-neutral-400 font-mono">
                 {multiReport.successfulCount} captured
+                {multiReport.totalDurationMs > 0 && ` in ${(multiReport.totalDurationMs / 1000).toFixed(1)}s`}
               </span>
             </div>
+
+            {/* Performance Diagnostics Grid */}
+            {multiReport.metrics && (
+              <div className="grid grid-cols-3 gap-1.5 pt-1.5 border-t border-neutral-800/80 text-center font-mono">
+                <div className="p-1.5 rounded-lg bg-neutral-950/60 border border-neutral-800">
+                  <div className="text-[9px] text-neutral-500 uppercase">Avg / Item</div>
+                  <div className="text-[11px] font-bold text-emerald-400">
+                    {multiReport.metrics.averageCaptureMs}ms
+                  </div>
+                </div>
+                <div className="p-1.5 rounded-lg bg-neutral-950/60 border border-neutral-800">
+                  <div className="text-[9px] text-neutral-500 uppercase">Workers</div>
+                  <div className="text-[11px] font-bold text-blue-400">
+                    {multiReport.metrics.peakConcurrency} slots
+                  </div>
+                </div>
+                <div className="p-1.5 rounded-lg bg-neutral-950/60 border border-neutral-800">
+                  <div className="text-[9px] text-neutral-500 uppercase">Reused</div>
+                  <div className="text-[11px] font-bold text-purple-400">
+                    {multiReport.metrics.skippedOrReused}
+                  </div>
+                </div>
+              </div>
+            )}
+
             {multiReport.failedCount > 0 && (
               <div className="text-[11px] text-amber-400 pt-1 border-t border-neutral-800">
                 <p className="font-medium">
-                  {multiReport.failedCount} interface{multiReport.failedCount > 1 ? 's' : ''} could not be captured:
+                  {multiReport.failedCount} interface{multiReport.failedCount > 1 ? 's' : ''} failed:
                 </p>
-                <ul className="list-disc pl-4 space-y-0.5 text-neutral-400 mt-1">
+                <ul className="list-disc pl-4 space-y-1 text-neutral-400 mt-1">
                   {multiReport.failures.map((f, i) => (
-                    <li key={i}>
-                      <strong className="text-neutral-300">{f.name}</strong>: {f.error}
+                    <li key={i} className="flex items-center justify-between gap-2">
+                      <span className="truncate">
+                        <strong className="text-neutral-300">{f.name}</strong>: {f.error}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleRetrySingle(f.route, f.name)}
+                        className="text-[10px] text-amber-300 underline shrink-0 hover:text-amber-200"
+                      >
+                        Retry
+                      </button>
                     </li>
                   ))}
                 </ul>
@@ -786,6 +845,18 @@ export const InterfaceCaptureScreen: React.FC = () => {
                         >
                           <Download className="w-3 h-3 text-black" />
                           <span>Save</span>
+                        </button>
+                      </div>
+                    )}
+                    {file.status === 'failed' && (
+                      <div className="flex flex-col gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleRetrySingle(file.route, file.interfaceName)}
+                          className="py-1 px-2.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 active:scale-95 text-[11px] font-medium flex items-center justify-center gap-1.5"
+                        >
+                          <RefreshCw className="w-3 h-3 text-amber-300" />
+                          <span>Retry</span>
                         </button>
                       </div>
                     )}

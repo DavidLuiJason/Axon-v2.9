@@ -1,11 +1,19 @@
 import { ScreenId } from '../types';
-export {
+import {
   registerInterfaceComponent,
   unregisterInterfaceComponent,
   getInterfaceComponent,
   hasInterfaceComponent,
   getAllRegisteredComponentKeys,
 } from './interfaceComponentRegistry';
+
+export {
+  registerInterfaceComponent,
+  unregisterInterfaceComponent,
+  getInterfaceComponent,
+  hasInterfaceComponent,
+  getAllRegisteredComponentKeys,
+};
 
 export type InterfaceCategory =
   | 'Core'
@@ -835,6 +843,23 @@ export function registerInterface(item: InterfaceMetadata): void {
 }
 
 /**
+ * Registers both interface metadata and its component dynamically in one call.
+ * Ensures any newly introduced screen, tool, dialog, or view becomes immediately discoverable and captureable.
+ */
+export function registerDynamicInterface(
+  meta: InterfaceMetadata,
+  component?: React.ComponentType<any>
+): void {
+  dynamicInterfacesMap.set(meta.id, meta);
+  if (component) {
+    registerInterfaceComponent(meta.id, component);
+    if (meta.route && meta.route !== meta.id) {
+      registerInterfaceComponent(meta.route, component);
+    }
+  }
+}
+
+/**
  * Unregisters a dynamically added interface.
  */
 export function unregisterInterface(id: string): void {
@@ -843,6 +868,7 @@ export function unregisterInterface(id: string): void {
 
 /**
  * Discovers all available interfaces in AXON, guaranteed to be deduplicated.
+ * Dynamically queries both static registrations and runtime component registries.
  */
 export function discoverAvailableInterfaces(options?: {
   rootOnly?: boolean;
@@ -863,6 +889,38 @@ export function discoverAvailableInterfaces(options?: {
       continue;
     }
     map.set(id, item);
+  }
+
+  // 3. Dynamically discover any newly registered components in interfaceComponentRegistry
+  try {
+    const allCompKeys = getAllRegisteredComponentKeys();
+    for (const key of allCompKeys) {
+      if (!map.has(key)) {
+        const formattedName = key
+          .split(/[-_]/)
+          .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+          .join(' ');
+
+        const isTool = key.startsWith('tool_') || key.includes('tool');
+        const isModal = key.includes('modal') || key.includes('drawer');
+        const cat: InterfaceCategory = isTool ? 'Tools' : isModal ? 'System' : 'Workspace';
+
+        map.set(key, {
+          id: key,
+          name: formattedName.startsWith('AXON') ? formattedName : `AXON • ${formattedName}`,
+          route: key,
+          category: cat,
+          level: isModal ? 'modal' : isTool ? 'sub_tool' : 'root',
+          description: `Dynamically discovered AXON interface (${key})`,
+          isAvailable: true,
+          isScrollable: true,
+          preferredDimensions: { width: 430, height: 932 },
+          keywords: [key.replace(/[-_]/g, ' ')],
+        });
+      }
+    }
+  } catch {
+    // Graceful fallback if component registry is not yet initialized
   }
 
   return Array.from(map.values());
